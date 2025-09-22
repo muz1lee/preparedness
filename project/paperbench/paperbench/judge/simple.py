@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from dataclasses import dataclass
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeAlias
@@ -18,6 +20,9 @@ from openai.types import CompletionUsage
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from preparedness_turn_completer.oai_completions_turn_completer import (
     OpenAICompletionsTurnCompleter,
+)
+from preparedness_turn_completer.google_completions_turn_completer import (
+    GoogleCompletionsTurnCompleter,
 )
 from preparedness_turn_completer.turn_completer import TurnCompleter
 from pydantic import BaseModel
@@ -111,25 +116,83 @@ class SimpleJudge(Judge):
         self.prompt = build_judge_task_prompt(code_only)
         self.buffer_tokens = buffer_tokens
         self.joined_addendum = f"{self.addendum if self.addendum else ''}\n{self.judge_addendum if self.judge_addendum else ''}".strip()
-        self.leaf_semaphore = asyncio.Semaphore(100)
+        # 允许通过环境变量降低叶子并发，缓解配额与峰值
+        try:
+            import os as _os
+            _leaf_limit = int(_os.getenv("PB_LEAF_CONCURRENCY", "100"))
+        except Exception:
+            _leaf_limit = 100
+        self.leaf_semaphore = asyncio.Semaphore(max(1, _leaf_limit))
         self.max_prior_nodes = max_prior_nodes
         if self.joined_addendum == "":
             self.joined_addendum = "(NO ADDENDUM GIVEN)"
         self.reproduce_touched_files = True  # by default assume reproduce was functional
         self.max_file_depth = max_file_depth
 
+        # ---- Progress tracking (rubric coverage & ETA) ----
+        self._progress_lock = asyncio.Lock()
+        self._completed_leaves: int = 0
+        self._total_leaves: int = self._count_total_leaves(self.rubric)
+        self._grading_start_time: float = time.time()
+        try:
+            # 初始快照（completed=0）
+            awaitable = self._save_progress_snapshot()
+            if asyncio.get_event_loop().is_running():
+                # fire-and-forget，避免阻塞构造
+                asyncio.create_task(awaitable)
+        except Exception:
+            pass
+
     def _init_structured_completer(
         self, config: TurnCompleter.Config | None, response_format: type[BaseModel]
     ) -> tuple[TurnCompleter.Config, TurnCompleter]:
         """
-        if `config` is provided, it is assumed that it will use `response_format` internally.
-        If `config` is not provided,
-        we fallback to a default OpenAICompletionsStructuredCompleter config
+        初始化解析用的completer：
+        - 若显式提供`config`，直接使用（假定其内部已处理结构化输出）。
+        - 若未提供：
+          * 若主`completer_config`是OpenAI类型，则使用OpenAI并传入`response_format`保证严格JSON。
+          * 否则（如Gemini），复用主`completer_config`（Google），并在解析逻辑中加强提示与JSON提取fallback。
+        这样在仅有Gemini API Key时也可工作。
         """
-        cfg = config or OpenAICompletionsTurnCompleter.Config(
-            model="gpt-4o-2024-08-06",
-            response_format=response_format,
-        )
+        if config is not None:
+            cfg = config
+        else:
+            if isinstance(self.completer_config, OpenAICompletionsTurnCompleter.Config):
+                cfg = OpenAICompletionsTurnCompleter.Config(
+                    model="gpt-4o-2024-08-06",
+                    response_format=response_format,
+                )
+            else:
+                # 如果主 completer 为 Google，可选择在解析步骤启用/关闭 JSON schema（由 PB_PARSE_SCHEMA 控制）
+                try:
+                    from preparedness_turn_completer.google_completions_turn_completer import (
+                        GoogleCompletionsTurnCompleter,
+                    )
+                    if isinstance(self.completer_config, GoogleCompletionsTurnCompleter.Config):
+                        parse_model = _os.getenv("PB_PARSE_MODEL", self.completer_config.model)
+                        use_schema = _os.getenv("PB_PARSE_SCHEMA", "true").lower() != "false"
+                        if use_schema:
+                            cfg = GoogleCompletionsTurnCompleter.Config(
+                                model=parse_model,
+                                api_key=getattr(self.completer_config, "api_key", None),
+                                temperature=self.completer_config.temperature,
+                                max_tokens=self.completer_config.max_tokens,
+                                top_p=self.completer_config.top_p,
+                                response_mime_type="application/json",
+                                response_schema_model=response_format,
+                            )
+                        else:
+                            cfg = GoogleCompletionsTurnCompleter.Config(
+                                model=parse_model,
+                                api_key=getattr(self.completer_config, "api_key", None),
+                                temperature=self.completer_config.temperature,
+                                max_tokens=self.completer_config.max_tokens,
+                                top_p=self.completer_config.top_p,
+                            )
+                    else:
+                        cfg = self.completer_config
+                except Exception:
+                    cfg = self.completer_config
         return cfg, cfg.build()
 
     async def process_file_content(self) -> None:
@@ -588,6 +651,11 @@ class SimpleJudge(Judge):
             leaf_logger = self.get_logger(task)
             leaf_std_logger = leaf_logger._logger
             try:
+                # 记录叶子开始事件
+                try:
+                    await self._append_leaf_event(task, event="leaf_start")
+                except Exception:
+                    pass
                 leaf_logger.info(f"Grading leaf: {task.requirements}")
                 if task.task_category == "Result Analysis" and not self.reproduce_touched_files:
                     leaf_logger.info(
@@ -641,20 +709,21 @@ class SimpleJudge(Judge):
                         },
                     )
 
-                    # Dump full messages
-                    if (
-                        self.log_path
-                        and leaf_std_logger is not None
-                        and leaf_std_logger.handlers
-                        and isinstance(leaf_std_logger.handlers[0], logging.FileHandler)
-                    ):
-                        log_file_path = leaf_std_logger.handlers[0].baseFilename
-                        with open(
-                            Path(log_file_path).parent / f"{task.id}_messages.jsonl", "w"
-                        ) as f:
-                            for message in messages:
-                                f.write(json.dumps(message) + "\n")
+                    # 更新进度（已完成叶子数 +1）
+                    try:
+                        async with self._progress_lock:
+                            self._completed_leaves += 1
+                        await self._save_progress_snapshot(last_leaf_id=task.id)
+                    except Exception:
+                        pass
 
+                    #（已按需精简：不再写入每个叶子的 messages.jsonl）
+
+                # 记录叶子完成事件
+                try:
+                    await self._append_leaf_event(task, event="leaf_done")
+                except Exception:
+                    pass
                 return graded_task_node
             finally:
                 if leaf_std_logger is not None:
@@ -668,10 +737,12 @@ class SimpleJudge(Judge):
         existing_usage: TokenUsage | None,
         incoming_usage: CompletionUsage | None,
     ) -> TokenUsage | None:
-        if isinstance(completer, OpenAICompletionsTurnCompleter):
+        # 兼容任意 completer：只要提供了 usage 就计入（OpenAI / Google 均可）
+        if incoming_usage is not None:
             if existing_usage is None:
                 existing_usage = TokenUsage()
-            existing_usage.add_from_completion(completer.model, incoming_usage)
+            model_name = getattr(completer, "model", "unknown")
+            existing_usage.add_from_completion(model_name, incoming_usage)
 
         return existing_usage
 
@@ -698,6 +769,78 @@ class SimpleJudge(Judge):
         graded_leaf_shim = await self.grade_leaf(leaf_shim)
         return graded_leaf_shim
 
+    def _count_total_leaves(self, node: TaskNode) -> int:
+        """递归统计 rubric 中叶子节点数量（以 TaskNode 无子任务为叶）。"""
+        try:
+            if not getattr(node, "sub_tasks", None):
+                return 1
+            return sum(self._count_total_leaves(ch) for ch in node.sub_tasks)
+        except Exception:
+            # 容错：无法解析则退回 0
+            return 0
+
+    async def _save_progress_snapshot(self, last_leaf_id: str | None = None) -> None:
+        """将当前进度快照写入 log_path/progress.json，包含已评测叶子、总叶子、百分比、ETA 等。"""
+        if not self.log_path:
+            return
+        try:
+            completed = self._completed_leaves
+            total = max(1, self._total_leaves)
+            pct = completed / total
+            elapsed = max(0.0, time.time() - self._grading_start_time)
+            remaining = max(total - completed, 0)
+            # 简单 ETA：用平均单叶耗时 * 剩余叶子数
+            avg = (elapsed / completed) if completed > 0 else 0.0
+            eta = avg * remaining
+
+            payload = {
+                "total_leaves": self._total_leaves,
+                "completed_leaves": completed,
+                "progress_pct": round(pct, 4),
+                "elapsed_seconds": round(elapsed, 2),
+                "eta_seconds": round(eta, 2),
+                "last_leaf_id": last_leaf_id,
+            }
+            out_path = Path(self.log_path) / "progress.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    async def _append_leaf_event(self, task: TaskNode, event: str) -> None:
+        """追加叶子级事件到 progress.leaves.jsonl，包含当前总体进度。"""
+        if not self.log_path:
+            return
+        try:
+            # 允许通过环境变量禁用叶子事件明细输出（默认禁用，避免产生大量文件）
+            import os as _os
+            if _os.getenv("PB_DISABLE_LEAF_EVENTS", "true").lower() == "true":
+                return
+            # 生成 ISO 简单时间戳
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            async with self._progress_lock:
+                completed = self._completed_leaves
+                total = max(1, self._total_leaves)
+                elapsed = max(0.0, time.time() - self._grading_start_time)
+                pct = completed / total
+                line = {
+                    "ts": ts,
+                    "event": event,
+                    "leaf_id": task.id,
+                    "task_category": task.task_category,
+                    "requirements": task.requirements,
+                    "completed": completed,
+                    "total": total,
+                    "progress_pct": round(pct, 4),
+                    "elapsed_seconds": round(elapsed, 2),
+                }
+                out_path = Path(self.log_path) / "progress.leaves.jsonl"
+                with open(out_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     async def _parse_model_response(
         self, response: str | None, continuous: bool = False
     ) -> tuple[
@@ -708,10 +851,21 @@ class SimpleJudge(Judge):
             raise ParseError("No response received")
 
         score_instruction = "(either 0 or 1)" if not continuous else "(between 0 and 1)"
+        # 使用原有规则提示，不改变判定与产出规则（可选附加格式提醒）
+        import os as _os
+        _sys_content = (
+            f"You are given a response output from a judge which should contain a score and an explanation. "
+            f"Please parse the text into a structured object containing `valid_score` (boolean indicating whether the response contains a valid score), "
+            f"the `score` {score_instruction}, and an `explanation` (a short summary of the judge's reasoning). "
+            f"If the response does not contain a valid score, set `valid_score` to False and set the `score` to 0.0."
+        )
+        if _os.getenv("PB_PARSE_FORMAT_HINT", "false").lower() == "true":
+            _sys_content += "\nFormat reminder: return a single JSON object; avoid extra text or code fences. This is a format preference and does not alter scoring rules."
+
         messages: list[ChatCompletionMessageParam] = [
             {
                 "role": "system",
-                "content": f"You are given a response output from a judge which should contain a score and an explanation. Please parse the text into a structured object containing `valid_score` (boolean indicating whether the response contains a valid score), the `score` {score_instruction}, and an `explanation` (a short summary of the judge's reasoning). If the response does not contain a valid score, set `valid_score` to False and set the `score` to 0.0.",
+                "content": _sys_content,
             },
             {
                 "role": "user",
@@ -733,7 +887,31 @@ class SimpleJudge(Judge):
                 usage = completion.usage
 
             content = completion.output_messages[0].content
-            judge_response = ParsedJudgeResponse.model_validate_json(content) if content else None
+
+            # 解析：优先直接作为JSON；失败则从文本中提取JSON片段再解析；仍失败则进行转义修复
+            judge_response = None
+            if content:
+                try:
+                    judge_response = ParsedJudgeResponse.model_validate_json(content)
+                except Exception:
+                    # 回退：尝试从文本中提取JSON对象再解析
+                    json_str = self._extract_json_object(content)
+                    if json_str:
+                        try:
+                            judge_response = ParsedJudgeResponse.model_validate_json(json_str)
+                        except Exception:
+                            # 二次回退：修复非法转义（如 LaTeX 的 \ell 等）后再解析
+                            fixed = self._sanitize_json_str(json_str)
+                            try:
+                                judge_response = ParsedJudgeResponse.model_validate_json(fixed)
+                            except Exception:
+                                # 最后尝试：先 json.loads，再用 pydantic 校验
+                                try:
+                                    obj = json.loads(fixed)
+                                    coerced = self._coerce_parsed_obj(obj, continuous)
+                                    judge_response = ParsedJudgeResponse.model_validate(coerced)
+                                except Exception:
+                                    judge_response = None
 
             if judge_response is None:
                 raise ParseError(f"Response could not be parsed: {content}")
@@ -743,3 +921,135 @@ class SimpleJudge(Judge):
             return judge_response, usage
         except Exception as e:
             raise ParseError(e) from e
+
+    def _extract_json_object(self, text: str) -> str | None:
+        """
+        从自由文本中提取第一个JSON对象子串。处理常见形式：
+        - 原始纯JSON
+        - ```json ... ``` 代码块
+        - 前后有解释性文本包裹
+        保守实现：寻找第一个'{'并进行括号配对。
+        """
+        if not text:
+            return None
+        # 快速路径：三引号json代码块
+        import re
+        # 优先 ```json ... ```
+        m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            return candidate if candidate else None
+        # 兼容无语言标注的 ``` ... ```
+        m2 = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
+        if m2:
+            candidate = m2.group(1).strip()
+            return candidate if candidate else None
+        # 一般路径：第一个'{'开始的匹配括号
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        return None
+
+    def _sanitize_json_str(self, s: str) -> str:
+        """
+        尝试修复常见的JSON非法转义问题：
+        - 将不在合法集合 [\, /, \\, b, f, n, r, t, u, "] 之后的单个反斜杠进行转义。
+        - 该修复主要应对 LaTeX 片段（如 \ell, \alpha）或路径中的反斜杠导致的解析失败。
+        """
+        # 先去掉可能残留的代码块标记
+        s = re.sub(r"^```json\s*|```\s*$", "", s.strip(), flags=re.IGNORECASE)
+        # 只处理字符串整体的非法反斜杠：(?<!\\)\\(?![\\/\"bfnrtu])
+        s = re.sub(r"(?<!\\)\\(?![\\/\"bfnrtu])", r"\\\\", s)
+        return s
+
+    def _coerce_parsed_obj(self, obj: object, continuous: bool) -> dict[str, object]:
+        """
+        将模型返回的宽松结构整形为 {valid_score: bool, score: number, explanation: str}
+        - 兼容 `score` 为对象的情况（例如 {"score": 1, "max_score": 1}）
+        - 兼容 `score` 为字符串或布尔
+        - 兼容 `explanation` 为列表/对象
+        - 对非连续评分（0/1）进行钳制；连续评分则限制在 [0,1]
+        """
+        if not isinstance(obj, dict):
+            return {"valid_score": False, "score": 0 if not continuous else 0.0, "explanation": str(obj)}
+
+        out: dict[str, object] = {}
+        # valid_score
+        valid = obj.get("valid_score")
+        if isinstance(valid, str):
+            valid = valid.strip().lower() in {"true", "1", "yes"}
+        elif not isinstance(valid, bool):
+            valid = True  # 默认认为有分数即可有效
+        out["valid_score"] = valid
+
+        # score
+        score_val = obj.get("score")
+        if isinstance(score_val, dict):
+            # 常见变体：{"score": 1, "max_score": 1}
+            inner = None
+            for k in ("score", "value", "val"):
+                if k in score_val and isinstance(score_val[k], (int, float, str)):
+                    inner = score_val[k]
+                    break
+            max_score = score_val.get("max_score") if isinstance(score_val.get("max_score"), (int, float)) else None
+            # 取 inner
+            try:
+                inner_num = float(inner) if inner is not None else 0.0
+            except Exception:
+                inner_num = 0.0
+            if continuous:
+                if max_score and float(max_score) > 0:
+                    score_num = inner_num / float(max_score)
+                else:
+                    score_num = inner_num
+                score_num = max(0.0, min(1.0, score_num))
+            else:
+                # 非连续：任何 >= 0.5 视为 1
+                score_num = 1.0 if inner_num >= 0.5 else 0.0
+        else:
+            # 标量或字符串
+            try:
+                score_num = float(score_val)
+            except Exception:
+                score_num = 0.0
+            if continuous:
+                score_num = max(0.0, min(1.0, score_num))
+            else:
+                score_num = 1.0 if score_num >= 0.5 else 0.0
+        out["score"] = score_num if continuous else int(score_num)
+
+        # explanation
+        expl = obj.get("explanation")
+        if isinstance(expl, list):
+            expl_str = "\n".join(str(x) for x in expl)
+        elif isinstance(expl, (dict, set, tuple)):
+            try:
+                expl_str = json.dumps(expl, ensure_ascii=False)
+            except Exception:
+                expl_str = str(expl)
+        else:
+            expl_str = str(expl) if expl is not None else ""
+        out["explanation"] = expl_str
+        return out
