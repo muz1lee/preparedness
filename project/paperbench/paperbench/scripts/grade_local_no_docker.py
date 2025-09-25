@@ -31,6 +31,8 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import re
+from statistics import mean
 
 import structlog
 
@@ -73,11 +75,20 @@ async def _grade_one(
     model: str,
     code_only: bool,
     resources_provided: bool,
-) -> bool:
-    ts = time.strftime("%Y-%m-%dT%H-%M-%S-%Z", time.gmtime())
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # 每个paper一次评分的独立日志目录
-    paper_run_dir = out_dir / f"{paper_id}_{ts}"
+    rep_idx: int = 0,
+) -> tuple[bool, Path]:
+    """对单个 submission 执行一次评分。
+
+    目录结构调整为嵌套：
+    <out_dir>/<paper_id>/<submission_name>/rep{N}_<UTC-micro>
+    这样避免并发同秒导致的目录名冲突，并使 run 与 submission 的对应关系清晰。
+    返回 (ok, paper_run_dir)。
+    """
+    # 高精度 UTC 时间戳（含微秒，后缀 Z）用于目录避免冲突
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    submission_name = submission_dir.name
+    # 每次评分的独立日志目录
+    paper_run_dir = out_dir / paper_id / submission_name / f"rep{rep_idx + 1}_{ts}"
     paper_run_dir.mkdir(parents=True, exist_ok=True)
     out_json = paper_run_dir / "grader_output.json"
 
@@ -123,14 +134,96 @@ async def _grade_one(
             success=ok,
         )
         _append_progress(paper_run_dir, paper_id, "judging_done", success=str(ok))
-        return ok
+        return ok, paper_run_dir
     except Exception as e:  # noqa: BLE001
         logger.exception("judging failed", paper_id=paper_id)
         _append_progress(paper_run_dir, paper_id, "judging_error", error=str(e))
-        return False
+        return False, paper_run_dir
     finally:
         # 临时 tar 包自动清理由系统完成；若需立即删除可在此手动删除
         _append_progress(paper_run_dir, paper_id, "cleanup")
+
+
+def _ts_to_iso_z(ts: str) -> str:
+    """将 grade.py 的 get_timestamp 风格（YYYY-MM-DDTHH-MM-SS-UTC）转换为 ISO Z（YYYY-MM-DDTHH:MM:SSZ）。若不匹配则原样返回。"""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})", ts or "")
+    if m:
+        return f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}Z"
+    return ts
+
+
+def _build_comparisons(out_dir: Path, run_dirs: list[Path]) -> list[Path]:
+    """基于本次运行成功的 run 目录，生成按 paper 聚合的对比 JSON。
+
+    输出路径：<out_dir>/<paper_id>__comparison__<UTC>.json
+    JSON 结构：
+    {
+      "paper_id": "...",
+      "submissions": {
+        "submission_v1": {
+          "runs": [{"run_dir": "<relative>", "timestamp": "...Z", "score": 0.331, "coverage_pct": 1.0}, ...],
+          "avg_score": 0.3365,
+          "score_pct": 33.65
+        },
+        ...
+      }
+    }
+    """
+    per_paper: dict[str, dict[str, list[dict]]]= {}
+
+    for rd in run_dirs:
+        try:
+            rel = rd.relative_to(out_dir)
+            parts = rel.parts
+            # 期望结构：<paper_id>/<submission_name>/<run_leaf>
+            if len(parts) < 3:
+                continue
+            paper_id = parts[0]
+            submission_name = parts[1]
+            grader_json = rd / "grader_output.json"
+            if not grader_json.exists():
+                continue
+            with open(grader_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            score = float(data.get("score", 0.0))
+            cov = None
+            if isinstance(data.get("progress"), dict):
+                cov = data["progress"].get("coverage_pct")
+            ts_raw = None
+            if isinstance(data.get("time_cost"), dict):
+                ts_raw = data["time_cost"].get("start_time")
+            timestamp = _ts_to_iso_z(ts_raw) if ts_raw else data.get("graded_at")
+            run_rec = {
+                "run_dir": str(rel),  # 使用 out_dir 相对路径，便于定位
+                "timestamp": timestamp,
+                "score": round(score, 3),
+                "coverage_pct": cov,
+            }
+            per_paper.setdefault(paper_id, {})
+            per_paper[paper_id].setdefault(submission_name, [])
+            per_paper[paper_id][submission_name].append(run_rec)
+        except Exception:
+            # 任意异常跳过该 run，保持聚合健壮性
+            continue
+
+    written: list[Path] = []
+    # 为每个 paper 写出一个对比文件
+    for paper_id, sub_map in per_paper.items():
+        out_payload = {"paper_id": paper_id, "submissions": {}}
+        for submission_name, runs in sorted(sub_map.items(), key=lambda kv: kv[0]):
+            scores = [r.get("score", 0.0) for r in runs if isinstance(r.get("score"), (int, float))]
+            avg = mean(scores) if scores else 0.0
+            out_payload["submissions"][submission_name] = {
+                "runs": runs,
+                "avg_score": round(avg, 4),
+                "score_pct": round(avg * 100.0, 2),
+            }
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+        comp_path = out_dir / f"{paper_id}__comparison__{ts}.json"
+        with open(comp_path, "w", encoding="utf-8") as f:
+            json.dump(out_payload, f, ensure_ascii=False, indent=2)
+        written.append(comp_path)
+    return written
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -145,7 +238,7 @@ async def _run(args: argparse.Namespace) -> int:
     tasks: list[asyncio.Task] = []
     sem = asyncio.Semaphore(args.max_concurrency)
 
-    async def _guarded_grade(paper_id: str, subdir: Path) -> bool:
+    async def _guarded_grade(paper_id: str, subdir: Path, rep_idx: int) -> tuple[bool, Path]:
         async with sem:
             # 简单节流：在高并发或严格限额下建议使用 --sleep-between
             if args.sleep_between > 0:
@@ -157,6 +250,7 @@ async def _run(args: argparse.Namespace) -> int:
                 model=args.model,
                 code_only=args.code_only,
                 resources_provided=args.resources_provided,
+                rep_idx=rep_idx,
             )
 
     for paper_dir in paper_dirs:
@@ -166,16 +260,34 @@ async def _run(args: argparse.Namespace) -> int:
             continue
         subdirs = [p for p in paper_dir.iterdir() if p.is_dir()]
         for subdir in subdirs:
-            tasks.append(asyncio.create_task(_guarded_grade(paper_id, subdir)))
+            # 对每个 submission 连续执行 N 次评分
+            for rep_idx in range(max(1, args.repeat)):
+                tasks.append(asyncio.create_task(_guarded_grade(paper_id, subdir, rep_idx)))
 
     if not tasks:
         logger.warning("未发现待评分的提交", submissions_dir=str(submissions_root))
         return 0
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    ok = sum(1 for r in results if r is True)
-    fail = sum(1 for r in results if r is False or isinstance(r, Exception))
+    success_dirs: list[Path] = []
+    ok = 0
+    fail = 0
+    for r in results:
+        if isinstance(r, Exception):
+            fail += 1
+            continue
+        ok_flag, run_dir = r
+        if ok_flag:
+            ok += 1
+            success_dirs.append(run_dir)
+        else:
+            fail += 1
     logger.info("grading finished", success=ok, failed=fail, total=len(results))
+
+    # 基于本次成功的 run 生成对比 JSON（按 paper 聚合）
+    written = _build_comparisons(out_dir, success_dirs)
+    if written:
+        logger.info("comparison json written", files=[str(p) for p in written])
     return 0 if fail == 0 else 1
 
 
@@ -219,6 +331,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help="每次调用之间的固定休眠秒数，用于限速（默认 0）",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="对每个 submission 重复评分次数（默认 1）",
     )
 
     args = parser.parse_args()
