@@ -37,22 +37,55 @@ export PB_DISABLE_LEAF_EVENTS=true      # 默认已禁用，不输出 progress.l
 
 3) 运行本地评分脚本（无需 Docker）
 
+目录组织要求：
+
+```
+<submissions_dir>/
+  <paper_id>/                # 与 registry 中的 paper id 一致（如 rice、pinn 等）
+    <submission_folder_A>/   # 同一论文可以有多个 submission 版本
+    <submission_folder_B>/
+    ...
+```
+
+示例运行（为每个 submission 连续评分 2 次，建议限速避免 429）：
+
 ```bash
 uv run python paperbench/scripts/grade_local_no_docker.py \
   --submissions-dir /abs/path/to/paperbench_submissions \
   --out-dir /abs/path/to/grader_outputs \
   --code-only \
+  --repeat 2 \
   --max-concurrency 1 \
   --sleep-between 60
 ```
 
-目录结构与产出
+目录结构与产出（本地脚本）
 
-- `<out-dir>/<paper_id>_<UTC>/progress.json`：快照（JSON 覆盖写）
-  - `total_leaves`、`completed_leaves`、`progress_pct`、`elapsed_seconds`、`eta_seconds`、`last_leaf_id`
-- `<out-dir>/<paper_id>_<UTC>/grader_output.json`：最终结果
-  - `time_cost`: `{start_time, end_time, total_time}`
-  - `progress`: `{total, completed, invalid, coverage_pct, elapsed_seconds}`
+- 单次评分产物（每次 run 独立目录）：
+  - `<out-dir>/<paper_id>/<submission_name>/rep{N}_<UTC微秒>/progress.json`：快照（覆盖写）
+    - `total_leaves`、`completed_leaves`、`progress_pct`、`elapsed_seconds`、`eta_seconds`、`last_leaf_id`
+  - `<out-dir>/<paper_id>/<submission_name>/rep{N}_<UTC微秒>/progress.jsonl`：步骤事件（脚本侧追加）
+  - `<out-dir>/<paper_id>/<submission_name>/rep{N}_<UTC微秒>/grader_output.json`：最终结果
+    - `time_cost`: `{start_time, end_time, total_time}`
+    - `progress`: `{total, completed, invalid, coverage_pct, elapsed_seconds}`
+- 自动对比产物（按论文聚合）：
+  - `<out-dir>/<paper_id>__comparison__<UTC微秒>.json`
+    - 结构示例：
+      ```json
+      {
+        "paper_id": "rice",
+        "submissions": {
+          "submission_v1": {
+            "runs": [
+              {"run_dir": "rice/submission_v1/rep1_...", "timestamp": "2025-09-25T10:12:53Z", "score": 0.331, "coverage_pct": 1.0},
+              {"run_dir": "rice/submission_v1/rep2_...", "timestamp": "2025-09-25T10:35:20Z", "score": 0.342, "coverage_pct": 1.0}
+            ],
+            "avg_score": 0.3365,
+            "score_pct": 33.65
+          }
+        }
+      }
+      ```
 
 关键参数与环境变量
 
@@ -60,6 +93,7 @@ uv run python paperbench/scripts/grade_local_no_docker.py \
   - `--submissions-dir` 提交根目录（结构：`<paper_id>/<submission_folder>`）
   - `--out-dir` 评分输出目录
   - `--code-only` 仅代码评分模式
+  - `--repeat` 对每个 submission 重复评分次数（默认 1）
   - `--max-concurrency` 论文级并发（建议 1）
   - `--sleep-between` 任务间隔（秒，建议 45~60）
 - 环境变量：
@@ -69,6 +103,11 @@ uv run python paperbench/scripts/grade_local_no_docker.py \
   - `PB_PARSE_MODEL`：解析步模型（如 `gemini-2.0-flash`）
   - `PB_PARSE_FORMAT_HINT`：解析提示附“格式提醒”（默认关闭）
   - `PB_DISABLE_LEAF_EVENTS`：禁用 progress.leaves.jsonl（默认 true）
+
+补充说明
+
+- 多论文：`--submissions-dir` 下若包含多个有效 `paper_id` 子目录（如 `rice/`、`pinn/`），脚本会分别对每篇论文下的所有 submission 评分并各自生成对比 JSON。
+- 只评某一篇：若只想评 `rice`，可将 `--submissions-dir` 指向其父目录，且该目录下仅包含 `rice/` 这一个子目录。
 
 注意事项
 
